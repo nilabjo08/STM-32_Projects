@@ -1,0 +1,273 @@
+// CAN Protocol Implementation - main.c
+// STM32 HAL Library - CAN + USART (500 kbps @ 36 MHz)
+// Assignment 2 - C8 EV Project
+// Author: Nilabja Jana
+// Date: April 2026
+
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+
+/* Peripheral Handles */
+CAN_HandleTypeDef hcan;
+UART_HandleTypeDef huart1;
+
+/* CAN TX/RX Structures */
+CAN_TxHeaderTypeDef TxHeader;
+CAN_RxHeaderTypeDef RxHeader;
+uint8_t TxData[8];
+uint8_t RxData[8];
+uint32_t TxMailbox;
+
+/* Error tracking */
+uint32_t can_error_count = 0;
+
+/* Block 2 - CAN Peripheral Initialisation (500 kbps @ 36 MHz) */
+/*
+Bit timing formula: Baud Rate = f_CAN / (Prescaler x (1 + BS1 + BS2))
+= 36 MHz / (4 x (1 + 15 + 2)) = 36 MHz / 72 = 500,000 bps exactly.
+Sample point = (1 + BS1)/(1 + BS1 + BS2) = 16 / 18 = 88.9% (ISO 11898 recommended range: 75-90%).
+*/
+
+static void MX_CAN_Init(void)
+{
+    hcan.Instance = CAN1;
+
+    /* FIX 1: Corrected bit timing for exact 500 kbps */
+    /* Formula: Baud = f_CAN / (Prescaler x (1 + BS1 + BS2))
+       Calc: 36 MHz / (4 x (1 + 15 + 2)) = 36 MHz / 72 = 500,000 bps
+       Sample: (1 + 15) / 18 = 88.9% (ISO 11898 compliant)
+    */
+    hcan.Init.Prescaler = 4;
+    hcan.Init.Mode = CAN_MODE_NORMAL;
+    hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
+    hcan.Init.TimeSeg1 = CAN_BS1_15TQ;
+    hcan.Init.TimeSeg2 = CAN_BS2_2TQ;
+
+    hcan.Init.TimeTriggeredMode = DISABLE;
+    hcan.Init.AutoBusOff = ENABLE;
+    hcan.Init.AutoWakeUp = ENABLE;
+    hcan.Init.AutoRetransmission = ENABLE;
+    hcan.Init.ReceiveFifoLocked = DISABLE;
+    hcan.Init.TransmitFifoPriority = DISABLE;
+
+    HAL_CAN_Init(&hcan);
+}
+
+/* Block 3 - CAN Filter Configuration (Selective Acceptance) */
+
+void CAN_Filter_Config(void)
+{
+    CAN_FilterTypeDef canFilter;
+    canFilter.FilterBank = 0;
+
+    canFilter.FilterMode = CAN_FILTERMODE_IDMASK;
+    canFilter.FilterScale = CAN_FILTERSCALE_32BIT;
+
+    /* Accept ONLY Sensor ECU (ID = 0x100).
+       In 32-bit scale, STD ID occupies bits [31:21] -> left-shift by 5.
+    */
+    canFilter.FilterIdHigh = (0x100 << 5);  /* 0x2000 */
+    canFilter.FilterIdLow = 0x0000;
+    canFilter.FilterMaskIdHigh = (0x7FF << 5);  /* 0xFFE0 - exact match */
+    canFilter.FilterMaskIdLow = 0x0000;
+
+    canFilter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+    canFilter.FilterActivation = ENABLE;
+    canFilter.SlaveStartFilterBank = 14;
+
+    HAL_CAN_ConfigFilter(&hcan, &canFilter);
+
+    /* NOTE: To accept ALL ECUs, set FilterMaskIdHigh = 0x0000 */
+}
+
+/* Block 4 - Multi-ECU Transmit Functions (Standard + Extended) */
+
+/* Sensor ECU: Standard frame, ID=0x100, 4 bytes */
+void CAN_TX_SensorECU(uint8_t temp, uint8_t voltage_hi, uint8_t voltage_lo, uint8_t status)
+{
+    char log[100];
+
+    TxHeader.StdId = 0x100;
+    TxHeader.ExtId = 0;
+    TxHeader.IDE = CAN_ID_STD;
+    TxHeader.RTR = CAN_RTR_DATA;
+    TxHeader.DLC = 4;
+    TxHeader.TransmitGlobalTime = DISABLE;
+
+    TxData[0] = temp;
+    TxData[1] = voltage_hi;
+    TxData[2] = voltage_lo;
+    TxData[3] = status;
+
+    if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) == HAL_OK)
+    {
+        sprintf(log, "[SENSOR ECU] TX STD ID:0x%03X DLC:%d DATA:%02X %02X %02X %02X\r\n",
+                (unsigned)TxHeader.StdId, TxHeader.DLC,
+                TxData[0], TxData[1], TxData[2], TxData[3]);
+        HAL_UART_Transmit(&huart1, (uint8_t*)log, strlen(log), HAL_MAX_DELAY);
+    }
+}
+
+/* Motor ECU: Standard frame, ID=0x200, 4 bytes */
+void CAN_TX_MotorECU(uint8_t rpm_hi, uint8_t rpm_lo, uint8_t torque, uint8_t direction)
+{
+    char log[100];
+
+    TxHeader.StdId = 0x200;
+    TxHeader.IDE = CAN_ID_STD;
+    TxHeader.DLC = 4;
+
+    TxData[0] = rpm_hi;
+    TxData[1] = rpm_lo;
+    TxData[2] = torque;
+    TxData[3] = direction;
+
+    if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) == HAL_OK)
+    {
+        sprintf(log, "[MOTOR ECU] TX STD ID:0x%03X DLC:%d DATA:%02X %02X %02X %02X\r\n",
+                (unsigned)TxHeader.StdId, TxHeader.DLC,
+                TxData[0], TxData[1], TxData[2], TxData[3]);
+        HAL_UART_Transmit(&huart1, (uint8_t*)log, strlen(log), HAL_MAX_DELAY);
+    }
+}
+
+/* BMS ECU: Extended frame (29-bit), ID=0x1FFFFFFF, 8 bytes */
+void CAN_TX_BmsECU(uint8_t soc, uint8_t fault_flags)
+{
+    char log[120];
+
+    TxHeader.ExtId = 0x1FFFFFFF;
+    TxHeader.IDE = CAN_ID_EXT;
+    TxHeader.RTR = CAN_RTR_DATA;
+    TxHeader.DLC = 8;
+
+    TxData[0] = soc;
+    TxData[1] = fault_flags;
+    TxData[2] = 0x42;
+    TxData[3] = 0x18;
+    TxData[4] = 0x23;
+    TxData[5] = 0x00;
+    TxData[6] = 0x00;
+    TxData[7] = 0xAA;
+
+    if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) == HAL_OK)
+    {
+        sprintf(log, "[BMS ECU] TX EXT ID:0x%08X DLC:%d DATA:%02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+                (unsigned)TxHeader.ExtId, TxHeader.DLC,
+                TxData[0], TxData[1], TxData[2], TxData[3],
+                TxData[4], TxData[5], TxData[6], TxData[7]);
+        HAL_UART_Transmit(&huart1, (uint8_t*)log, strlen(log), HAL_MAX_DELAY);
+    }
+}
+
+/* Block 5 - Interrupt-Driven RX Callback (FIFO0) */
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan_ptr)
+{
+    char log[160];
+
+    if (HAL_CAN_GetRxMessage(hcan_ptr, CAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
+    {
+        if (RxHeader.IDE == CAN_ID_STD)
+            sprintf(log, "[RX] STD ID:0x%03X DLC:%d DATA:",
+                    (unsigned)RxHeader.StdId, RxHeader.DLC);
+        else
+            sprintf(log, "[RX] EXT ID:0x%08X DLC:%d DATA:",
+                    (unsigned)RxHeader.ExtId, RxHeader.DLC);
+
+        for (int i = 0; i < RxHeader.DLC; i++)
+        {
+            char byte_str[6];
+            sprintf(byte_str, "%02X ", RxData[i]);
+            strcat(log, byte_str);
+        }
+        strcat(log, "\r\n");
+
+        HAL_UART_Transmit(&huart1, (uint8_t*)log, strlen(log), HAL_MAX_DELAY);
+    }
+}
+
+/* Block 6 - CAN Error Callback (Fault Detection & Bus Recovery) */
+
+void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *hcan_ptr)
+{
+    char err_msg[120];
+    uint32_t err = HAL_CAN_GetError(hcan_ptr);
+    can_error_count++;
+
+    sprintf(err_msg, "[CAN ERROR] Code:0x%08X Count:%lu\r\n",
+            (unsigned)err, can_error_count);
+    HAL_UART_Transmit(&huart1, (uint8_t*)err_msg, strlen(err_msg), HAL_MAX_DELAY);
+
+    if (err & HAL_CAN_ERROR_BOF)
+    {
+        HAL_UART_Transmit(&huart1, (uint8_t*)"[ERROR] BUS-OFF detected!\r\n", 30, HAL_MAX_DELAY);
+        HAL_CAN_Stop(hcan_ptr);
+        HAL_CAN_Init(hcan_ptr);
+        HAL_CAN_Start(hcan_ptr);
+        HAL_UART_Transmit(&huart1, (uint8_t*)"[RECOVERY] CAN restarted.\r\n", 28, HAL_MAX_DELAY);
+    }
+    else if (err & HAL_CAN_ERROR_EPV)
+        HAL_UART_Transmit(&huart1, (uint8_t*)"[ERROR] Error Passive state.\r\n", 32, HAL_MAX_DELAY);
+    else if (err & HAL_CAN_ERROR_STF)
+        HAL_UART_Transmit(&huart1, (uint8_t*)"[ERROR] Bit Stuffing error.\r\n", 31, HAL_MAX_DELAY);
+    else if (err & HAL_CAN_ERROR_CRC)
+        HAL_UART_Transmit(&huart1, (uint8_t*)"[ERROR] CRC error detected.\r\n", 31, HAL_MAX_DELAY);
+    else if (err & HAL_CAN_ERROR_ACK)
+        HAL_UART_Transmit(&huart1, (uint8_t*)"[ERROR] ACK error - no ack.\r\n", 31, HAL_MAX_DELAY);
+}
+
+/* Block 7 - UART Initialisation */
+
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 115200;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    HAL_UART_Init(&huart1);
+}
+
+/* Block 8 - main() with Multi-ECU Transmission Loop */
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_CAN_Init();       /* Now initialises at correct 500 kbps */
+    MX_USART1_UART_Init();
+
+    CAN_Filter_Config();
+    HAL_CAN_Start(&hcan);
+
+    HAL_CAN_ActivateNotification(&hcan,
+        CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_ERROR |
+        CAN_IT_BUSOFF | CAN_IT_ERROR_PASSIVE);
+
+    HAL_UART_Transmit(&huart1, (uint8_t*)"CAN Bus Initialised. 500 kbps\r\n", 32, HAL_MAX_DELAY);
+
+    uint8_t counter = 0;
+
+    while (1)
+    {
+        counter++;
+
+        /* Sensor ECU: Temperature=35C, Voltage=3.60V, Status=0x01 */
+        CAN_TX_SensorECU(0x23, 0x01, 0x68, 0x01);
+        HAL_Delay(333);
+
+        /* Motor ECU: RPM=1500 (0x05DC), Torque=80Nm, Dir=FWD */
+        CAN_TX_MotorECU(0x05, 0xDC, 0x50, 0x01);
+        HAL_Delay(333);
+
+        /* BMS ECU: SOC=75%, Fault=0x00 (no fault) */
+        CAN_TX_BmsECU(0x4B, 0x00);
+        HAL_Delay(334);
+    }
+}
