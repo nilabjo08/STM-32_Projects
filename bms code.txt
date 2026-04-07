@@ -1,0 +1,250 @@
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+
+/* Peripheral Handles */
+ADC_HandleTypeDef hadc1;
+UART_HandleTypeDef huart1;
+TIM_HandleTypeDef htim2;   /* FIX 2: Hardware timer for 1-s ISR */
+
+/* Safety Thresholds */
+#define OVER_VOLTAGE        4.2f
+#define UNDER_VOLTAGE       3.0f
+#define OVER_TEMP           60.0f
+#define OVER_CURRENT        20.0f
+
+/* Hysteresis Recovery Thresholds */
+#define RECOVER_VOLTAGE_HIGH 4.10f
+#define RECOVER_VOLTAGE_LOW  3.10f
+#define RECOVER_TEMP         55.0f
+#define RECOVER_CURRENT      18.0f
+
+/* ACS712-20A */
+#define ACS712_OFFSET       2.5f
+#define ACS712_SENS         0.1f
+
+/* Relay Pin */
+#define RELAY_PORT          GPIOA
+#define RELAY_PIN           GPIO_PIN_8
+
+/* Battery Capacity */
+#define Q_TOTAL_AH          10.0f   /* 10 Ah cell */
+
+/* Global Sensor Variables */
+uint16_t adc_raw;
+float battery_voltage;
+float temperature;
+float battery_current;
+float soc_ocv;
+float soc_coulomb;
+float soc;
+uint8_t relay_state = 1;   /* 1 = ON (safe), 0 = OFF (fault) */
+
+/* FIX 2: Flag set by TIM2 ISR */
+volatile uint8_t timer_tick = 0;    /* Set to 1 every 1 second by TIM2 */
+
+/* SOC Estimation: OCV Look-Up Table */
+float SOC_Voltage[] = {3.00f, 3.20f, 3.40f, 3.60f, 3.80f, 4.00f, 4.20f};
+float SOC_Percent[] = {0.0f, 10.0f, 20.0f, 40.0f, 60.0f, 80.0f, 100.0f};
+#define SOC_TABLE_SIZE 7
+
+float Estimate_SOC_OCV(float voltage)
+{
+    if (voltage <= SOC_Voltage[0]) return 0.0f;
+    if (voltage >= SOC_Voltage[SOC_TABLE_SIZE - 1]) return 100.0f;
+
+    for (int i = 0; i < SOC_TABLE_SIZE - 1; i++)
+    {
+        /* FIXED: <= instead of < so exact table values interpolate correctly */
+        if (voltage >= SOC_Voltage[i] && voltage <= SOC_Voltage[i + 1])
+        {
+            float slope = (SOC_Percent[i + 1] - SOC_Percent[i]) /
+                          (SOC_Voltage[i + 1] - SOC_Voltage[i]);
+            return SOC_Percent[i] + slope * (voltage - SOC_Voltage[i]);
+        }
+    }
+    return 0.0f;
+}
+
+/* ADC Read */
+uint16_t Read_ADC(uint32_t channel)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
+    adc_raw = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+
+    return adc_raw;
+}
+
+/* ACS712 Current Calculation */
+float Read_Current(void)
+{
+    float v = (Read_ADC(ADC_CHANNEL_2) * 3.3f / 4095.0f) * 2.0f;
+    return (v - ACS712_OFFSET) / ACS712_SENS;
+}
+
+/* BMS Check with Hysteresis Relay Logic */
+void BMS_Check(void)
+{
+    char alert[130];
+    uint8_t fault = 0;
+
+    /* 1. Detect Faults */
+    if (battery_voltage > OVER_VOLTAGE)
+    {
+        sprintf(alert, "[FAULT] OVER-VOLTAGE! %.2fV > %.2fV\r\n",
+                battery_voltage, OVER_VOLTAGE);
+        HAL_UART_Transmit(&huart1, (uint8_t*)alert, strlen(alert), HAL_MAX_DELAY);
+        fault = 1;
+    }
+
+    if (battery_voltage < UNDER_VOLTAGE)
+    {
+        sprintf(alert, "[FAULT] UNDER-VOLTAGE! %.2fV < %.2fV\r\n",
+                battery_voltage, UNDER_VOLTAGE);
+        HAL_UART_Transmit(&huart1, (uint8_t*)alert, strlen(alert), HAL_MAX_DELAY);
+        fault = 1;
+    }
+
+    if (temperature > OVER_TEMP)
+    {
+        sprintf(alert, "[FAULT] OVER-TEMP! %.2fC > %.2fC\r\n",
+                temperature, OVER_TEMP);
+        HAL_UART_Transmit(&huart1, (uint8_t*)alert, strlen(alert), HAL_MAX_DELAY);
+        fault = 1;
+    }
+
+    if (battery_current > OVER_CURRENT)
+    {
+        sprintf(alert, "[FAULT] OVER-CURRENT! %.2fA > %.2fA\r\n",
+                battery_current, OVER_CURRENT);
+        HAL_UART_Transmit(&huart1, (uint8_t*)alert, strlen(alert), HAL_MAX_DELAY);
+        fault = 1;
+    }
+
+    /* 2. Hysteresis Relay Logic */
+    if (fault)
+    {
+        relay_state = 0;
+    }
+    else if (relay_state == 0)
+    {
+        if (battery_voltage < RECOVER_VOLTAGE_HIGH &&
+            battery_voltage > RECOVER_VOLTAGE_LOW &&
+            temperature < RECOVER_TEMP &&
+            battery_current < RECOVER_CURRENT)
+        {
+            relay_state = 1;
+        }
+    }
+
+    /* 3. Apply Relay State */
+    if (relay_state == 1)
+    {
+        HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_SET);
+        HAL_UART_Transmit(&huart1,
+                          (uint8_t*)"[STATUS] RELAY ON - Battery Safe.\r\n",
+                          36, HAL_MAX_DELAY);
+    }
+    else
+    {
+        HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_RESET);
+        HAL_UART_Transmit(&huart1,
+                          (uint8_t*)"[ACTION] RELAY OFF - Battery Isolated.\r\n",
+                          41, HAL_MAX_DELAY);
+    }
+}
+
+/* TIM2 Period-Elapsed Callback—fires exactly every 1 second.
+   Coulomb integration happens here, decoupled from UART/sensor latency. */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2)
+    {
+        /* Read Sensors */
+        battery_voltage = (Read_ADC(ADC_CHANNEL_0) * 3.3f / 4095.0f) * 2.0f;
+        temperature = (Read_ADC(ADC_CHANNEL_1) * 3.3f / 4095.0f) * 100.0f;
+        battery_current = Read_Current();
+
+        /* Coulomb Counting—exact 1 tick
+           dSOC = -(I * dt) / Q_total * 100%
+           dt = exactly 1 s (guaranteed by TIM2) */
+        soc_coulomb -= (battery_current / 3600.0f) / Q_TOTAL_AH * 100.0f;
+
+        if (soc_coulomb < 0.0f) soc_coulomb = 0.0f;
+        if (soc_coulomb > 100.0f) soc_coulomb = 100.0f;
+
+        soc = soc_coulomb;
+        timer_tick = 1;   /* Signal main() to log UART & run BMS_Check */
+    }
+}
+
+/* TIM2 Initialisation (1 s period at 84 MHz with PSC=8399, ARR=9999) */
+void MX_TIM2_Init(void)
+{
+    HAL_RCC_TIM2_CLK_ENABLE();
+
+    htim2.Instance = TIM2;
+    htim2.Init.Prescaler = 8399;   /* 84 MHz / (8399+1) = 10 kHz */
+    htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim2.Init.Period = 9999;      /* 10 kHz / (9999+1) = 1 Hz */
+    htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+
+    HAL_TIM_Base_Init(&htim2);
+
+    HAL_NVIC_SetPriority(TIM2_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM2_IRQn);
+}
+
+void TIM2_IRQHandler(void)
+{
+    HAL_TIM_IRQHandler(&htim2);
+}
+
+int main(void)
+{
+    char msg[180];
+
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_ADC1_Init();
+    MX_USART1_UART_Init();
+    MX_TIM2_Init();   /* FIX 2: Initialise TIM2 */
+
+    /* SOC Initialisation at Startup (OCV method) */
+    battery_voltage = (Read_ADC(ADC_CHANNEL_0) * 3.3f / 4095.0f) * 2.0f;
+    soc_coulomb = Estimate_SOC_OCV(battery_voltage);   /* seed counter */
+    soc = soc_coulomb;
+
+    HAL_TIM_Base_Start_IT(&htim2);   /* Start TIM2 interrupt */
+
+    while (1)
+    {
+        /* FIX 2: Block here until TIM2 ISR fires (no HAL_Delay drift) */
+        if (timer_tick)
+        {
+            timer_tick = 0;   /* Clear flag */
+
+            /* Sensors + SOC already updated in ISR — just run safety & log */
+            BMS_Check();
+
+            sprintf(msg, "V:%.2fV | T:%.2fC | I:%.2fA | SOC:%.1f%% | Relay:%s\r\n",
+                    battery_voltage, temperature, battery_current, soc,
+                    relay_state ? "ON" : "OFF");
+
+            HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        }
+
+        /* CPU is free here for other low-priority tasks */
+    }
+}
